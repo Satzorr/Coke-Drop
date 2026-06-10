@@ -221,7 +221,16 @@ RegisterNetEvent('coke_drop:client:InboundDrop', function(dropPos, callerSrc, pa
         SetEntityAsMissionEntity(chute, true, true)
         AttachEntityToEntity(chute, crate, 0, 0.0, 0.0, 3.0, 0.0, 0.0, 0.0, false, false, false, false, 2, true)
 
-        ActiveCrate = { obj = crate, chute = chute, packageKey = packageKey, landed = false }
+        -- Spawn flare grenade inside the crate to explode on landing
+        local flareGrenadeHash = GetHashKey('WEAPON_FLARE')
+        RequestModel(flareGrenadeHash)
+        local flareWeapon = CreateObject(flareGrenadeHash, dropPos.x, dropPos.y, Config.Drop.SpawnHeight, false, false, false)
+        if DoesEntityExist(flareWeapon) then
+            SetEntityAsMissionEntity(flareWeapon, true, true)
+            AttachEntityToEntity(flareWeapon, crate, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, false, false, false, false, 2, true)
+        end
+
+        ActiveCrate = { obj = crate, chute = chute, packageKey = packageKey, landed = false, flare = flareWeapon }
 
         -- Keep pushing crate down until landed
         CreateThread(function()
@@ -231,9 +240,10 @@ RegisterNetEvent('coke_drop:client:InboundDrop', function(dropPos, callerSrc, pa
             end
         end)
 
-        -- Landing detection
+        -- Landing detection with improved physics
         CreateThread(function()
-            while DoesEntityExist(crate) do
+            local landingAttempts = 0
+            while DoesEntityExist(crate) and landingAttempts < 300 do
                 Wait(300)
                 local cp = GetEntityCoords(crate)
                 local found, gz = GetGroundZFor_3dCoord(cp.x, cp.y, cp.z, false)
@@ -245,15 +255,20 @@ RegisterNetEvent('coke_drop:client:InboundDrop', function(dropPos, callerSrc, pa
                     print('[coke_drop] CLIENT: Crate landed at ' .. tostring(cp))
                     local fp = vector3(cp.x, cp.y, gz + 0.05)
 
+                    -- Set crate to landed position and lock it down completely
                     SetEntityCoords(crate, fp.x, fp.y, fp.z, false, false, false, false)
+                    SetEntityVelocity(crate, 0.0, 0.0, 0.0)
                     FreezeEntityPosition(crate, true)
                     SetEntityDynamic(crate, false)
+                    SetEntityCollision(crate, true, true)
+                    SetEntityCanBeDamaged(crate, false)
 
                     if chute and DoesEntityExist(chute) then
                         DetachEntity(chute, true, false)
                         SetEntityAsMissionEntity(chute, true, true)
                         FreezeEntityPosition(chute, true)
                         SetEntityCoords(chute, fp.x + 1.5, fp.y + 1.5, fp.z, false, false, false, false)
+                        SetEntityDynamic(chute, false)
                         -- clean up after blip expires
                         SetTimeout(Config.Drop.BlipDuration * 1000, function()
                             if DoesEntityExist(chute) then
@@ -263,22 +278,15 @@ RegisterNetEvent('coke_drop:client:InboundDrop', function(dropPos, callerSrc, pa
                         end)
                     end
 
-                    -- Flare effect using particle (ThrowProjectile not available in FiveM)
-                    RequestNamedPtfxAsset('scr_rcbarry2')
-                    local pt = 0
-                    while not HasNamedPtfxAssetLoaded('scr_rcbarry2') and pt < 30 do Wait(100); pt = pt + 1 end
-                    if HasNamedPtfxAssetLoaded('scr_rcbarry2') then
-                        UseParticleFxAssetNextCall('scr_rcbarry2')
-                        local fx = StartParticleFxLoopedAtCoord(
-                            'scr_rcbarry2_alien_dis',
-                            fp.x, fp.y, fp.z + 0.3,
-                            0.0, 0.0, 0.0, 1.5, false, false, false, false
-                        )
-                        SetParticleFxLoopedColour(fx, 1.0, 0.1, 0.0, false)
-                        SetTimeout(Config.Drop.BlipDuration * 1000, function()
-                            StopParticleFxLooped(fx, false)
-                        end)
+                    -- Trigger flare grenade explosion visual at crate location (GTA flare effect)
+                    if ActiveCrate and ActiveCrate.flare and DoesEntityExist(ActiveCrate.flare) then
+                        DetachEntity(ActiveCrate.flare, true, false)
+                        DeleteObject(ActiveCrate.flare)
+                        ActiveCrate.flare = nil
                     end
+                    
+                    -- Fire ambient flare grenade at landing spot for smoke signal
+                    FireAmbientGrenade(fp.x, fp.y, fp.z, GetHashKey('WEAPON_FLARE'))
 
                     if ActiveCrate then
                         ActiveCrate.landed = true
@@ -287,6 +295,8 @@ RegisterNetEvent('coke_drop:client:InboundDrop', function(dropPos, callerSrc, pa
 
                     break
                 end
+                
+                landingAttempts = landingAttempts + 1
             end
         end)
 
@@ -307,14 +317,16 @@ CreateThread(function()
         local crateObj    = hasActive and ActiveCrate.obj or nil
         local crateExists = crateObj ~= nil and DoesEntityExist(crateObj)
 
-        if landed and not looted and crateExists and not pickupCooldown then
-            local playerCoords = GetEntityCoords(PlayerPedId())
+        if landed and not looted and crateExists then
+            local playerPed    = PlayerPedId()
+            local playerCoords = GetEntityCoords(playerPed)
             local crateCoords  = GetEntityCoords(crateObj)
             local dist         = #(playerCoords - crateCoords)
 
             if dist < 2.5 then
                 local playerData  = QBCore.Functions.GetPlayerData()
                 local hasCrowbar  = false
+                
                 if playerData and playerData.items then
                     for _, item in pairs(playerData.items) do
                         if item and item.name == 'crowbar' and item.amount > 0 then
@@ -336,28 +348,37 @@ CreateThread(function()
                 end
                 EndTextCommandDisplayText(0.5, 0.92)
 
-                if IsControlJustPressed(0, 38) and hasCrowbar then
-                    pickupCooldown = true
+                if IsControlJustPressed(0, 38) then
+                    if not hasCrowbar then
+                        QBCore.Functions.Notify('~r~You need a crowbar!', 'error', 3000)
+                    else
+                        pickupCooldown = true
 
-                    local pkg = Config.Packages[ActiveCrate.packageKey]
-                    if pkg then
-                        local total = pkg.amount
-                        for i = 1, total do
-                            if not ActiveCrate or ActiveCrate.looted then break end
+                        local pkg = Config.Packages[ActiveCrate.packageKey]
+                        if pkg then
+                            local total = pkg.amount
+                            for i = 1, total do
+                                if not ActiveCrate or ActiveCrate.looted then break end
 
-                            LoadAnimDict('mp_common')
-                            TaskPlayAnim(PlayerPedId(), 'mp_common', 'givetake1_b', 3.0, 3.0, 2500, 0, 0, false, false, false)
-                            QBCore.Functions.Notify('Looting... (' .. i .. '/' .. total .. ')', 'primary', 2500)
-                            Wait(2500)
+                                LoadAnimDict('mp_common')
+                                TaskPlayAnim(playerPed, 'mp_common', 'givetake1_b', 3.0, 3.0, 1500, 0, 0, false, false, false)
+                                Wait(1500)
 
-                            TriggerServerEvent('coke_drop:server:PickupBrick', ActiveCrate.packageKey)
+                                TriggerServerEvent('coke_drop:server:PickupBrick', ActiveCrate.packageKey)
+                                
+                                -- Add 3-5sec delay between each brick
+                                if i < total then
+                                    local delay = math.random(3000, 5000)
+                                    Wait(delay)
+                                end
+                            end
+
+                            if ActiveCrate then ActiveCrate.looted = true end
+                            QBCore.Functions.Notify('Crate looted.', 'success', 4000)
                         end
 
-                        if ActiveCrate then ActiveCrate.looted = true end
-                        QBCore.Functions.Notify('Crate looted.', 'success', 4000)
+                        pickupCooldown = false
                     end
-
-                    pickupCooldown = false
                 end
 
                 Wait(0)
